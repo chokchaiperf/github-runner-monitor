@@ -9,6 +9,7 @@ import requests
 import os
 import sys
 import re
+import time
 from html.parser import HTMLParser
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -20,6 +21,12 @@ STATE_FILE      = ".last_runner_release"
 
 # OS filter — เปลี่ยนเป็น list ว่าง [] เพื่อดูทุก release
 WATCH_OS = ["ubuntu", "macos", "windows"]
+
+# จำกัดจำนวน notification สูงสุดต่อรอบ (ป้องกัน flood เวลา first run หรือ clear state)
+MAX_NOTIFY_PER_RUN = 5
+
+# หน่วงเวลาระหว่าง Discord request (วินาที) — Discord rate limit ~5 req/2s per webhook
+DISCORD_RATE_LIMIT_DELAY = 1.5
 
 # สี embed ตาม OS
 COLORS = {
@@ -219,6 +226,7 @@ def send_discord(release: dict):
     resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
     resp.raise_for_status()
     print(f"  ✅ Sent: {tag}")
+    time.sleep(DISCORD_RATE_LIMIT_DELAY)  # หน่วงเพื่อหลีก Discord rate limit
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -245,9 +253,17 @@ def main():
         print("✅ No new releases to notify.")
         return
 
-    print(f"Found {len(new_releases)} new release(s) — sending to Discord...")
+    total = len(new_releases)
+    print(f"Found {total} new release(s).")
 
-    for r in reversed(new_releases):
+    if total > MAX_NOTIFY_PER_RUN:
+        print(f"⚠️  Too many at once ({total}) — sending only the latest {MAX_NOTIFY_PER_RUN} to avoid Discord flood.")
+        # เอาเฉพาะ MAX_NOTIFY_PER_RUN รายการล่าสุด (index 0 = newest)
+        new_releases = new_releases[:MAX_NOTIFY_PER_RUN]
+
+    print(f"Sending {len(new_releases)} notification(s) to Discord...")
+
+    for r in reversed(new_releases):  # ส่งจากเก่าไปใหม่
         send_discord(r)
 
     save_last_seen(releases[0]["tag_name"])
