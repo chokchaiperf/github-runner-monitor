@@ -1,0 +1,37 @@
+name: Monitor GitHub Runner Images
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # ทุก 6 ชั่วโมง
+  workflow_dispatch:         # trigger manual ได้
+
+permissions:
+  contents: write            # สำหรับ commit .last_runner_release กลับ repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check runner image releases
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/check_runner_images.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last_runner_release
+          git diff --staged --quiet || git commit -m "chore: update last seen runner release [skip ci]"
+          git push
