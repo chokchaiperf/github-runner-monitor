@@ -197,7 +197,7 @@ def save_last_seen(tag: str):
         f.write(tag)
 
 
-def fetch_releases(per_page: int = 20) -> list:
+def fetch_releases(per_page: int = 50) -> list:
     resp = requests.get(
         f"https://api.github.com/repos/{REPO}/releases",
         headers=gh_headers(),
@@ -257,17 +257,22 @@ def main():
     print(f"Found {total} new release(s).")
 
     if total > MAX_NOTIFY_PER_RUN:
-        print(f"⚠️  Too many at once ({total}) — sending only the latest {MAX_NOTIFY_PER_RUN} to avoid Discord flood.")
-        # เอาเฉพาะ MAX_NOTIFY_PER_RUN รายการล่าสุด (index 0 = newest)
-        new_releases = new_releases[:MAX_NOTIFY_PER_RUN]
+        # ส่งแค่ batch แรก (เก่าสุด MAX_NOTIFY_PER_RUN อัน) แล้วรอบถัดไปค่อยส่งต่อ
+        # new_releases[0] = newest, [-1] = oldest → เอา oldest batch ก่อน
+        print(f"⚠️  Too many at once ({total}) — sending oldest {MAX_NOTIFY_PER_RUN} first, the rest will follow in the next run.")
+        to_send = new_releases[-MAX_NOTIFY_PER_RUN:]   # oldest MAX_NOTIFY_PER_RUN
+        next_last_seen = new_releases[-(MAX_NOTIFY_PER_RUN + 1)]["tag_name"] if len(new_releases) > MAX_NOTIFY_PER_RUN else releases[0]["tag_name"]
+    else:
+        to_send = new_releases
+        next_last_seen = releases[0]["tag_name"]
 
-    print(f"Sending {len(new_releases)} notification(s) to Discord...")
+    print(f"Sending {len(to_send)} notification(s) to Discord...")
 
-    for r in reversed(new_releases):  # ส่งจากเก่าไปใหม่
+    for r in reversed(to_send):  # ส่งจากเก่าไปใหม่
         send_discord(r)
 
-    save_last_seen(releases[0]["tag_name"])
-    print(f"State updated → {releases[0]['tag_name']}")
+    save_last_seen(next_last_seen)
+    print(f"State updated → {next_last_seen}")
 
 
 if __name__ == "__main__":
