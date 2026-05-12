@@ -2,7 +2,7 @@
 check_runner_images.py
 
 ดึง release ใหม่จาก actions/runner-images แล้วส่ง notification ไปที่ Discord
-รัน on: GitHub Actions (scheduled / manual)
+format: Option B Full Detail — Announcements + Image Info fields + Changes per category
 """
 
 import requests
@@ -19,16 +19,11 @@ GH_TOKEN        = os.environ.get("GH_TOKEN", "")
 REPO            = "actions/runner-images"
 STATE_FILE      = ".last_runner_release"
 
-# OS filter — เปลี่ยนเป็น list ว่าง [] เพื่อดูทุก release
 WATCH_OS = ["ubuntu", "macos", "windows"]
 
-# จำกัดจำนวน notification สูงสุดต่อรอบ (ป้องกัน flood เวลา first run หรือ clear state)
-MAX_NOTIFY_PER_RUN = 5
+MAX_NOTIFY_PER_RUN   = 5
+DISCORD_RATE_LIMIT   = 1.5   # วินาที ระหว่าง request
 
-# หน่วงเวลาระหว่าง Discord request (วินาที) — Discord rate limit ~5 req/2s per webhook
-DISCORD_RATE_LIMIT_DELAY = 1.5
-
-# สี embed ตาม OS
 COLORS = {
     "ubuntu":  0xE95420,
     "macos":   0x555555,
@@ -36,139 +31,217 @@ COLORS = {
 }
 DEFAULT_COLOR = 0x5865F2
 
-
 # ─── HTML Table Parser ────────────────────────────────────────────────────────
 
-class TableParser(HTMLParser):
-    """แปลง HTML <table> เป็น list of rows (list of cells)"""
+class ChangeTableParser(HTMLParser):
+    """
+    Parse <table> ของ GitHub runner-images release
+    รองรับ <td rowspan="N"> — category cell จะปรากฏครั้งเดียวแล้วหายไปใน row ถัดๆ ไป
+    ผลลัพธ์: list of dict {category, tool, prev, curr}
+    """
 
     def __init__(self):
         super().__init__()
-        self.tables: list[list[list[str]]] = []
-        self._current_table: list[list[str]] = []
+        self.rows: list[dict] = []
         self._current_row: list[str] = []
         self._current_cell: str = ""
-        self._in_cell = False
+        self._in_cell: bool = False
+        self._in_thead: bool = False
+        self._current_category: str = ""
 
     def handle_starttag(self, tag, attrs):
-        if tag == "table":
-            self._current_table = []
-        elif tag in ("tr",):
+        if tag == "thead":
+            self._in_thead = True
+        elif tag == "tbody":
+            self._in_thead = False
+        elif tag == "tr":
             self._current_row = []
         elif tag in ("th", "td"):
             self._current_cell = ""
             self._in_cell = True
 
     def handle_endtag(self, tag):
-        if tag == "table":
-            self.tables.append(self._current_table)
-            self._current_table = []
-        elif tag == "tr":
-            if self._current_row:
-                self._current_table.append(self._current_row)
-            self._current_row = []
+        if tag == "thead":
+            self._in_thead = False
         elif tag in ("th", "td"):
             self._current_row.append(self._current_cell.strip())
             self._in_cell = False
+        elif tag == "tr":
+            if not self._in_thead:
+                self._process_row(self._current_row)
+            self._current_row = []
 
     def handle_data(self, data):
         if self._in_cell:
             self._current_cell += data
 
-
-def table_to_text(rows: list[list[str]]) -> str:
-    """แปลง rows เป็น text สำหรับ Discord"""
-    if not rows:
-        return ""
-
-    lines = []
-    headers = rows[0]
-    data_rows = rows[1:]
-
-    # หา index ของ column ที่สนใจ: Tool name, Previous, Current
-    try:
-        tool_idx = next(i for i, h in enumerate(headers) if "tool" in h.lower() or "name" in h.lower())
-    except StopIteration:
-        tool_idx = 0
-
-    prev_idx = next((i for i, h in enumerate(headers) if "previous" in h.lower()), None)
-    curr_idx = next((i for i, h in enumerate(headers) if "current" in h.lower()), None)
-
-    for row in data_rows:
-        if len(row) <= tool_idx:
-            continue
-        tool = row[tool_idx]
-        if not tool:  # rowspan cell ว่าง — ข้ามได้
-            continue
-
-        if prev_idx is not None and curr_idx is not None:
-            prev = row[prev_idx] if prev_idx < len(row) else "?"
-            curr = row[curr_idx] if curr_idx < len(row) else "?"
-            lines.append(f"• **{tool}**: `{prev}` → `{curr}`")
+    def _process_row(self, row: list[str]):
+        if len(row) == 4:
+            # [category, tool, prev, curr]
+            cat = row[0].strip()
+            if cat:
+                self._current_category = cat
+            tool, prev, curr = row[1], row[2], row[3]
+        elif len(row) == 3:
+            # rowspan → ไม่มี category cell
+            tool, prev, curr = row[0], row[1], row[2]
         else:
-            lines.append(f"• {tool}")
+            return
 
-    return "\n".join(lines)
+        if tool.strip():
+            self.rows.append({
+                "category": self._current_category,
+                "tool":     tool.strip(),
+                "prev":     prev.strip(),
+                "curr":     curr.strip(),
+            })
 
 
-def convert_html_tables(body: str) -> str:
-    """แทน <table>...</table> ใน body ด้วย plain text"""
-    # ดึง table blocks ทั้งหมด
-    table_pattern = re.compile(r"<table>.*?</table>", re.DOTALL | re.IGNORECASE)
-    table_blocks = table_pattern.findall(body)
+# ─── Body Parsers ─────────────────────────────────────────────────────────────
 
-    if not table_blocks:
-        return body
+def parse_announcements(body: str) -> list[str]:
+    """ดึง announcement lines จาก markdown table แบบนี้:
+    | Announcements |
+    |-|
+    | some text |
+    """
+    lines = []
+    in_announce = False
+    for line in body.splitlines():
+        s = line.strip()
+        if re.match(r"\|\s*Announcements\s*\|", s, re.IGNORECASE):
+            in_announce = True
+            continue
+        if in_announce:
+            if re.match(r"\|[-\s|]+\|", s):   # separator row
+                continue
+            if s.startswith("|") and s.endswith("|"):
+                content = s[1:-1].strip()
+                # ลบ markdown link เหลือแค่ text
+                content = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", content)
+                if content:
+                    lines.append(content)
+            else:
+                break   # ออกจาก table
+    return lines
 
-    parser = TableParser()
-    result = body
 
-    for html_block in table_blocks:
-        parser.__init__()
-        parser.feed(html_block)
-        if parser.tables:
-            text = table_to_text(parser.tables[0])
-            result = result.replace(html_block, text if text else "_(ไม่มีข้อมูล)_")
-
+def parse_image_info(body: str) -> dict:
+    """ดึง OS Version, Kernel Version, Image Version จากบรรทัดแบบ:
+    • OS Version: macOS 26.3.1 (25D2128)
+    """
+    result = {}
+    mapping = {
+        "OS Version": r"[•*-]\s*OS Version:\s*(.+)",
+        "Kernel":     r"[•*-]\s*Kernel Version:\s*(.+)",
+        "Image":      r"[•*-]\s*Image Version:\s*(.+)",
+    }
+    for key, pattern in mapping.items():
+        m = re.search(pattern, body)
+        if m:
+            result[key] = m.group(1).strip()
     return result
 
 
-# ─── Body Formatter ───────────────────────────────────────────────────────────
+def parse_changes(body: str) -> dict[str, list[dict]]:
+    """ดึง HTML tables แล้ว group by category → {category: [{tool, prev, curr}]}"""
+    table_blocks = re.findall(r"<table>.*?</table>", body, re.DOTALL | re.IGNORECASE)
+    groups: dict[str, list[dict]] = {}
 
-def format_body(raw_body: str, max_chars: int = 1800) -> str:
-    if not raw_body:
-        return "_ไม่มีรายละเอียดใน release นี้_"
+    for block in table_blocks:
+        parser = ChangeTableParser()
+        parser.feed(block)
+        for row in parser.rows:
+            cat = row["category"] or "Other"
+            groups.setdefault(cat, []).append(row)
 
-    body = convert_html_tables(raw_body)
-
-    # ตัด section ยาวๆ ที่ไม่จำเป็น (Installed Software / full tool list)
-    # เก็บแค่ Announcements + What's changed (Updated)
-    keep_sections = []
-    current_section = []
-    skip = False
-
-    for line in body.splitlines():
-        # ข้าม section ที่ซ้ำซ้อน/ยาวเกิน
-        if re.match(r"#+\s*(Installed Software|Full list|Cached tools)", line, re.IGNORECASE):
-            skip = True
-        elif re.match(r"#+\s", line):
-            skip = False
-
-        if not skip:
-            keep_sections.append(line)
-
-    body = "\n".join(keep_sections).strip()
-
-    # ตัด blank lines เกิน 2 บรรทัด
-    body = re.sub(r"\n{3,}", "\n\n", body)
-
-    if len(body) > max_chars:
-        body = body[:max_chars] + "\n\n_...ดูเพิ่มเติมที่ GitHub_"
-
-    return body
+    return groups
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Discord Payload Builder ──────────────────────────────────────────────────
+
+def get_color(tag: str) -> int:
+    for key, color in COLORS.items():
+        if key in tag.lower():
+            return color
+    return DEFAULT_COLOR
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def build_discord_payload(release: dict) -> dict:
+    tag  = release["tag_name"]
+    body = release.get("body", "") or ""
+
+    # ── 1. Parse sections ──────────────────────────────────────────────────
+    announcements = parse_announcements(body)
+    image_info    = parse_image_info(body)
+    changes       = parse_changes(body)
+
+    # ── 2. Description — Announcements ────────────────────────────────────
+    desc_parts = []
+    for ann in announcements:
+        is_warn = any(kw in ann.lower() for kw in
+                      ["deprecat", "unsupport", "removal", "end of life", "will be"])
+        prefix = "⚠️" if is_warn else "✅"
+        desc_parts.append(f"{prefix} {ann}")
+
+    description = "\n".join(desc_parts) if desc_parts else None
+
+    # ── 3. Fields ──────────────────────────────────────────────────────────
+    fields = []
+
+    # 3a. Image Info (inline, 3 columns)
+    for key in ("OS Version", "Kernel", "Image"):
+        if key in image_info:
+            fields.append({"name": key, "value": image_info[key], "inline": True})
+
+    # 3b. Changes per category
+    if changes:
+        total_tools = sum(len(v) for v in changes.values())
+        fields.append({
+            "name":   "📢 What's changed?",
+            "value":  f"{total_tools} tool(s) updated across {len(changes)} category(ies)",
+            "inline": False,
+        })
+
+        for cat, rows in changes.items():
+            lines = []
+            for row in rows:
+                prev = _truncate(row["prev"], 30)
+                curr = _truncate(row["curr"], 30)
+                lines.append(f"• **{row['tool']}**: `{prev}` → `{curr}`")
+
+            value = _truncate("\n".join(lines), 1024)
+            fields.append({"name": cat, "value": value, "inline": False})
+
+            # Discord limit: max 25 fields per embed
+            if len(fields) >= 24:
+                fields.append({
+                    "name":   "...",
+                    "value":  "_ดูรายละเอียดทั้งหมดที่ GitHub_",
+                    "inline": False,
+                })
+                break
+
+    # ── 4. Assemble embed ─────────────────────────────────────────────────
+    embed: dict = {
+        "title":     f"🖥️ Runner Image Update: `{tag}`",
+        "url":       release["html_url"],
+        "color":     get_color(tag),
+        "fields":    fields,
+        "footer":    {"text": f"GitHub / {REPO}"},
+        "timestamp": release["published_at"],
+    }
+    if description:
+        embed["description"] = _truncate(description, 4096)
+
+    return {"embeds": [embed]}
+
+
+# ─── GitHub + State Helpers ───────────────────────────────────────────────────
 
 def gh_headers() -> dict:
     h = {"Accept": "application/vnd.github.v3+json"}
@@ -177,11 +250,15 @@ def gh_headers() -> dict:
     return h
 
 
-def get_color(tag: str) -> int:
-    for key, color in COLORS.items():
-        if key in tag.lower():
-            return color
-    return DEFAULT_COLOR
+def fetch_releases(per_page: int = 50) -> list:
+    resp = requests.get(
+        f"https://api.github.com/repos/{REPO}/releases",
+        headers=gh_headers(),
+        params={"per_page": per_page},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def load_last_seen() -> str:
@@ -197,36 +274,14 @@ def save_last_seen(tag: str):
         f.write(tag)
 
 
-def fetch_releases(per_page: int = 50) -> list:
-    resp = requests.get(
-        f"https://api.github.com/repos/{REPO}/releases",
-        headers=gh_headers(),
-        params={"per_page": per_page},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
+# ─── Discord Sender ───────────────────────────────────────────────────────────
 
 def send_discord(release: dict):
-    tag  = release["tag_name"]
-    body = format_body(release.get("body", ""))
-
-    payload = {
-        "embeds": [{
-            "title":       f"🖥️ Runner Image Update: `{tag}`",
-            "url":         release["html_url"],
-            "description": body,
-            "color":       get_color(tag),
-            "footer":      {"text": f"GitHub / {REPO}"},
-            "timestamp":   release["published_at"],
-        }]
-    }
-
+    payload = build_discord_payload(release)
     resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
     resp.raise_for_status()
-    print(f"  ✅ Sent: {tag}")
-    time.sleep(DISCORD_RATE_LIMIT_DELAY)  # หน่วงเพื่อหลีก Discord rate limit
+    print(f"  ✅ Sent: {release['tag_name']}")
+    time.sleep(DISCORD_RATE_LIMIT)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -245,7 +300,7 @@ def main():
     for r in releases:
         if r["tag_name"] == last_seen:
             break
-        if WATCH_OS and not any(os_key in r["tag_name"].lower() for os_key in WATCH_OS):
+        if WATCH_OS and not any(k in r["tag_name"].lower() for k in WATCH_OS):
             continue
         new_releases.append(r)
 
@@ -257,18 +312,15 @@ def main():
     print(f"Found {total} new release(s).")
 
     if total > MAX_NOTIFY_PER_RUN:
-        # ส่งแค่ batch แรก (เก่าสุด MAX_NOTIFY_PER_RUN อัน) แล้วรอบถัดไปค่อยส่งต่อ
-        # new_releases[0] = newest, [-1] = oldest → เอา oldest batch ก่อน
-        print(f"⚠️  Too many at once ({total}) — sending oldest {MAX_NOTIFY_PER_RUN} first, the rest will follow in the next run.")
-        to_send = new_releases[-MAX_NOTIFY_PER_RUN:]   # oldest MAX_NOTIFY_PER_RUN
-        next_last_seen = new_releases[-(MAX_NOTIFY_PER_RUN + 1)]["tag_name"] if len(new_releases) > MAX_NOTIFY_PER_RUN else releases[0]["tag_name"]
+        print(f"⚠️  Capping at {MAX_NOTIFY_PER_RUN} (oldest first) — remainder will follow next run.")
+        to_send       = new_releases[-MAX_NOTIFY_PER_RUN:]
+        next_last_seen = new_releases[-(MAX_NOTIFY_PER_RUN + 1)]["tag_name"]
     else:
-        to_send = new_releases
+        to_send        = new_releases
         next_last_seen = releases[0]["tag_name"]
 
-    print(f"Sending {len(to_send)} notification(s) to Discord...")
-
-    for r in reversed(to_send):  # ส่งจากเก่าไปใหม่
+    print(f"Sending {len(to_send)} notification(s)...")
+    for r in reversed(to_send):   # เก่า → ใหม่
         send_discord(r)
 
     save_last_seen(next_last_seen)
