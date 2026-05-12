@@ -26,6 +26,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_MENTION_IDS: ${{ secrets.DISCORD_MENTION_IDS }}
         run: python scripts/check_runner_images.py
 
       - name: Commit updated state

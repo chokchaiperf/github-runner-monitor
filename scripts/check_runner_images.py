@@ -24,6 +24,11 @@ WATCH_OS = ["ubuntu", "macos", "windows"]
 MAX_NOTIFY_PER_RUN   = 5
 DISCORD_RATE_LIMIT   = 1.5   # วินาที ระหว่าง request
 
+# Discord User IDs ที่จะ mention ทุกครั้ง (คั่นด้วย comma ใน secret)
+# เช่น "123456789,987654321"
+_raw_ids = os.environ.get("DISCORD_MENTION_IDS", "")
+MENTION_IDS: list[str] = [i.strip() for i in _raw_ids.split(",") if i.strip()]
+
 COLORS = {
     "ubuntu":  0xE95420,
     "macos":   0x555555,
@@ -238,7 +243,13 @@ def build_discord_payload(release: dict) -> dict:
     if description:
         embed["description"] = _truncate(description, 4096)
 
-    return {"embeds": [embed]}
+    payload: dict = {"embeds": [embed]}
+
+    # mention users — ต้องอยู่ใน content ไม่ใช่ embed ถึงจะ ping จริง
+    if MENTION_IDS:
+        payload["content"] = " ".join(f"<@{uid}>" for uid in MENTION_IDS)
+
+    return payload
 
 
 # ─── GitHub + State Helpers ───────────────────────────────────────────────────
